@@ -351,15 +351,25 @@ class CombinedSession:
 
     # ── run ───────────────────────────────────────────────────────────────────
 
-    def run(self) -> "CombinedResult":
+    def run(self, held_out_flight: str | None = None) -> "CombinedResult":
         """
         1. Concatenate all flights' sensor DataFrames into one dataset.
-        2. Randomly split into train / test at the timestep level.
+        2. Split into train / test:
+             - If held_out_flight is set: that flight is test-only,
+               all others use the random train/test split.
+             - Otherwise: stratified random split across all flights.
         3. Calibrate LWC and MVD on training rows.
         4. Predict on the full dataset and report test-set metrics.
+
+        Parameters
+        ----------
+        held_out_flight : optional flight name to exclude from training entirely.
+                          All timesteps for that flight become test-only.
         """
         print(f"\n{'═' * 55}")
         print("  COMBINED DATASET SPLIT")
+        if held_out_flight:
+            print(f"  Leave-one-out: '{held_out_flight}' held out for testing only")
         print(f"{'═' * 55}")
 
         # ── Step 1: combine ───────────────────────────────────────────────
@@ -371,33 +381,37 @@ class CombinedSession:
 
         combined_sensor = pd.concat(parts, ignore_index=True)
 
-        # Work at the timestep level using SENSOR==1 rows as anchors
-        # so all 5 sensors for a given timestep always go to the same split
         s1 = combined_sensor[combined_sensor["SENSOR"] == 1].copy()
         n_total = len(s1)
         print(f"\n  Total timesteps : {n_total:,}")
-        print(f"  Test fraction   : {self.test_fraction:.0%}")
 
-        # ── Stratified split — each flight contributes proportionally ──────
-        rng = np.random.default_rng(self.random_seed)
+        rng    = np.random.default_rng(self.random_seed)
         s1["_split"] = "train"
 
-        print("\n  Stratified sampling per flight:")
+        print("\n  Split assignment per flight:")
         for name in self._flights:
             flight_mask  = s1["_flight"] == name
             flight_idxs  = s1.index[flight_mask]
-            n_test_flight = max(1, int(len(flight_idxs) * self.test_fraction))
-            chosen = rng.choice(flight_idxs, size=n_test_flight, replace=False)
-            s1.loc[chosen, "_split"] = "test"
-            n_tr = len(flight_idxs) - n_test_flight
-            print(f"    {name:<20}  total={len(flight_idxs):,}  "
-                  f"test={n_test_flight:,}  train={n_tr:,}")
+
+            if held_out_flight and name == held_out_flight:
+                # Entire flight is test-only
+                s1.loc[flight_idxs, "_split"] = "test"
+                print(f"    {name:<20}  total={len(flight_idxs):,}  "
+                      f"*** HELD OUT (test only) ***")
+            else:
+                # Stratified random split
+                n_test_flight = max(1, int(len(flight_idxs) * self.test_fraction))
+                chosen = rng.choice(flight_idxs, size=n_test_flight, replace=False)
+                s1.loc[chosen, "_split"] = "test"
+                n_tr = len(flight_idxs) - n_test_flight
+                print(f"    {name:<20}  total={len(flight_idxs):,}  "
+                      f"test={n_test_flight:,}  train={n_tr:,}")
 
         n_test  = (s1["_split"] == "test").sum()
         n_train = (s1["_split"] == "train").sum()
         print(f"\n  Total: {n_train:,} train / {n_test:,} test timesteps")
 
-        # Broadcast split label to all 5 sensor rows using TIME as key
+        # Broadcast split to all 5 sensor rows
         time_to_split = dict(zip(s1["TIME"].values, s1["_split"].values))
         combined_sensor["_split"] = combined_sensor["TIME"].map(time_to_split)
 

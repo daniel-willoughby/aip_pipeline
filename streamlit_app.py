@@ -129,63 +129,57 @@ st.markdown("""
 
 # ── Robust classification constants ──────────────────────────────────────────
 
-# Substrings found in flight file headers (any row of first 2)
 _FLIGHT_SIGNALS = [
-    "iasp",                 # IASP 1 - True Airspeed...
-    "true airspeed",
-    "pressure altitude",
-    "static pressure true",
-    "icd lwc",              # M300 reference probe
-    "ccp mvd",
+    "iasp", "true airspeed", "pressure altitude",
+    "static pressure true", "icd lwc", "ccp mvd",
 ]
+_LOG_TIME_CANDIDATES = ["time s", "time_s", "time (s)", "elapsed_s", "time inc"]
 
-# Log files always have TFS col0 + TIM col1
-_LOG_TIME_CANDIDATES = [
-    "time s", "time_s", "time (s)", "elapsed_s", "time inc",
-]
+# Minimum fraction of a log's duration that must fall within a flight window
+# for the match to be accepted. 0.80 = 80% of the log must be inside the flight.
+MATCH_THRESHOLD = 0.80
 
 
 def classify_and_get_range(uploaded_file) -> tuple[str, float, float]:
     """
-    Robustly classify an uploaded file as 'flight' or 'log' and return
-    its elapsed time range (t_min, t_max) in seconds.
+    Classify a file as 'flight' or 'log' and return its time range as
+    seconds-past-midnight (absolute, for matching across files).
 
-    Classification strategy (in order):
-      1. Any FLIGHT_SIGNALS substring found in the first two header rows → flight
-      2. TFS + TIM columns present → log
-      3. KTAS without IASP → log
-      4. Unknown — returns ('unknown', 0, 0)
+    Classification:
+      1. Any flight signal in first two header rows  → flight
+      2. TFS + TIM columns present                   → log
+      3. KTAS without IASP                           → log
+      4. Unknown                                     → ('unknown', 0, 0)
 
-    Time extraction strategy:
-      Flight: col index 1 (skip units row at row 0)
-              Falls back to 'Time inc' or any named time column
-      Log:    Named time column ('Time S', 'Time s', etc.)
-              Falls back to computing (TIM - TIM[0]) / 1e6
-              Falls back to parsing TFS datetime strings
+    Time extraction — all return seconds-past-midnight:
+      Flight:  col 0 = absolute seconds past midnight
+      Log TFS as numeric in 0–86400 range: seconds past midnight directly
+      Log TFS as datetime string:          convert to seconds past midnight
+      Log TFS as epoch / unreliable:       fall back to elapsed duration
+                                           (matched by duration similarity)
     """
     import openpyxl
     import pandas as pd
 
     data = uploaded_file.getbuffer()
 
-    # ── Step 1: classify ───────────────────────────────────────────────────
+    # ── Classify ───────────────────────────────────────────────────────────
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
     ws = wb.active
     first_two_rows = list(ws.iter_rows(max_row=2, values_only=True))
     wb.close()
 
-    all_header_text = " ".join(
+    all_text = " ".join(
         str(c).strip().lower()
         for row in first_two_rows for c in row if c is not None
     )
-    row0_cells = [str(c).strip().lower() if c else ""
-                  for c in first_two_rows[0]]
+    row0 = [str(c).strip().lower() if c else "" for c in first_two_rows[0]]
 
-    has_flight_signal = any(sig in all_header_text for sig in _FLIGHT_SIGNALS)
-    has_tfs = any("tfs" in c for c in row0_cells[:4])
-    has_tim = any(c == "tim" for c in row0_cells[:4])
-    has_ktas = "ktas" in all_header_text
-    has_iasp = "iasp" in all_header_text
+    has_flight_signal = any(sig in all_text for sig in _FLIGHT_SIGNALS)
+    has_tfs  = any("tfs" in c for c in row0[:4])
+    has_tim  = any(c == "tim" for c in row0[:4])
+    has_ktas = "ktas" in all_text
+    has_iasp = "iasp" in all_text
 
     if has_flight_signal:
         kind = "flight"
@@ -196,93 +190,132 @@ def classify_and_get_range(uploaded_file) -> tuple[str, float, float]:
     else:
         return "unknown", 0.0, 0.0
 
-    # ── Step 2: extract time range ─────────────────────────────────────────
-    df = pd.read_excel(io.BytesIO(data), engine="openpyxl", header=0)
-    col_names_lower = [str(c).strip().lower() for c in df.columns]
+    # ── Extract time range ─────────────────────────────────────────────────
+    df          = pd.read_excel(io.BytesIO(data), engine="openpyxl", header=0)
+    col_lower   = [str(c).strip().lower() for c in df.columns]
 
     if kind == "flight":
-        # Look for a named elapsed-time column first
-        elapsed_col = next(
-            (df.columns[i] for i, c in enumerate(col_names_lower)
-             if c in _LOG_TIME_CANDIDATES), None
-        )
-        if elapsed_col is None:
-            # Default: col index 1 (always elapsed seconds in flight files)
-            elapsed_col = df.columns[1]
+        # Col 0 = absolute seconds past midnight; skip row 0 (units row)
+        abs_sec = pd.to_numeric(df.iloc[1:, 0], errors="coerce").dropna()
+        abs_sec = abs_sec[abs_sec > 0]
+        if len(abs_sec) == 0:
+            return kind, 0.0, 0.0
+        return kind, float(abs_sec.min()), float(abs_sec.max())
 
-        # Skip the units row (first data row in flight files)
-        t = pd.to_numeric(df.iloc[1:][elapsed_col], errors="coerce").dropna()
+    # ── Log file time extraction ───────────────────────────────────────────
+    tfs_idx = next((i for i, c in enumerate(col_lower) if "tfs" in c), None)
+    tim_idx = next((i for i, c in enumerate(col_lower) if c == "tim"), None)
+
+    if tfs_idx is not None:
+        tfs_raw = df.iloc[:, tfs_idx]
+
+        # Case 1: TFS is numeric in seconds-past-midnight range (0–86400)
+        tfs_num = pd.to_numeric(tfs_raw, errors="coerce").dropna()
+        if len(tfs_num) > 10:
+            med = tfs_num.median()
+            if 0 < med < 86400:
+                # Valid seconds-past-midnight
+                return kind, float(tfs_num.min()), float(tfs_num.max())
+
+        # Case 2: TFS is a datetime string
+        tfs_dt = pd.to_datetime(tfs_raw, errors="coerce").dropna()
+        if len(tfs_dt) > 10 and tfs_dt.dt.year.median() > 2000:
+            tod = (tfs_dt.dt.hour * 3600 +
+                   tfs_dt.dt.minute * 60 +
+                   tfs_dt.dt.second +
+                   tfs_dt.dt.microsecond / 1e6)
+            return kind, float(tod.min()), float(tod.max())
+
+    # Case 3: TFS unreliable — use elapsed time for duration-based matching
+    # Return kind="log_elapsed" so matcher uses duration similarity instead
+    time_col = next((df.columns[i] for i, c in enumerate(col_lower)
+                     if c in _LOG_TIME_CANDIDATES), None)
+    if time_col is not None:
+        t = pd.to_numeric(df[time_col], errors="coerce").dropna()
         t = t[t >= 0]
+        if len(t) > 0:
+            return "log_elapsed", float(t.min()), float(t.max())
 
-    else:  # log
-        # Strategy 1: named time column
-        elapsed_col = next(
-            (df.columns[i] for i, c in enumerate(col_names_lower)
-             if c in _LOG_TIME_CANDIDATES), None
-        )
-        if elapsed_col is not None:
-            t = pd.to_numeric(df[elapsed_col], errors="coerce").dropna()
-            t = t[t >= 0]
+    if tim_idx is not None:
+        tim = pd.to_numeric(df.iloc[:, tim_idx], errors="coerce").dropna()
+        t   = (tim - tim.iloc[0]) / 1_000_000
+        return "log_elapsed", float(t.min()), float(t.max())
+
+    return kind, 0.0, 0.0
+
+
+def _containment_score(f_min, f_max, l_min, l_max) -> float:
+    """Fraction of the log's duration that falls within the flight window."""
+    overlap  = max(0.0, min(f_max, l_max) - max(f_min, l_min))
+    log_span = l_max - l_min
+    return overlap / log_span if log_span > 0 else 0.0
+
+
+def _duration_score(f_min, f_max, l_min, l_max) -> float:
+    """
+    Similarity of durations — used for logs without absolute timestamps.
+    Score of 1.0 means identical duration.
+    """
+    f_dur = f_max - f_min
+    l_dur = l_max - l_min
+    diff  = abs(f_dur - l_dur)
+    return 1.0 - diff / max(f_dur, l_dur) if max(f_dur, l_dur) > 0 else 0.0
+
+
+def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
+    """
+    Match each log to its best flight and reject poor matches.
+
+    Logs with absolute timestamps (kind='log') are matched by containment:
+      what fraction of the log's duration falls within the flight window?
+
+    Logs with only elapsed time (kind='log_elapsed') are matched by duration
+    similarity: which flight has the most similar total duration?
+
+    Returns: (groups, rejected, warnings)
+      groups:   {flight_name: [(log_name, score), ...]}
+      rejected: [(log_name, best_score, best_flight_name)]
+      warnings: [human-readable warning string]
+    """
+    groups   = defaultdict(list)
+    rejected = []
+    warnings = []
+
+    for lname, (lkind, lt_min, lt_max) in log_info.items():
+        if lkind == "log_elapsed":
+            # Duration-based matching for logs without absolute timestamps
+            scores = {
+                fname: _duration_score(fv[1], fv[2], lt_min, lt_max)
+                for fname, fv in flight_info.items()
+            }
+            threshold = 0.95  # duration must match within 5%
         else:
-            # Strategy 2: compute from TIM microsecond counter
-            tim_col = next(
-                (df.columns[i] for i, c in enumerate(col_names_lower)
-                 if c == "tim"), None
+            # Absolute containment matching
+            scores = {
+                fname: _containment_score(fv[1], fv[2], lt_min, lt_max)
+                for fname, fv in flight_info.items()
+            }
+            threshold = MATCH_THRESHOLD
+
+        best       = max(scores, key=scores.get)
+        best_score = scores[best]
+
+        if best_score < threshold:
+            rejected.append((lname, best_score, best))
+            method = "duration similarity" if lkind == "log_elapsed" else "time containment"
+            warnings.append(
+                f"**{lname}** could not be reliably matched to any flight "
+                f"({method} {best_score:.0%} < {threshold:.0%}). "
+                f"Check that the correct files were uploaded."
             )
-            if tim_col is not None:
-                tim = pd.to_numeric(df[tim_col], errors="coerce").dropna()
-                t = (tim - tim.iloc[0]) / 1_000_000
-            else:
-                # Strategy 3: parse TFS datetime strings
-                tfs_col = next(
-                    (df.columns[i] for i, c in enumerate(col_names_lower)
-                     if "tfs" in c), None
-                )
-                if tfs_col is not None:
-                    ts = pd.to_datetime(df[tfs_col], errors="coerce").dropna()
-                    t  = (ts - ts.iloc[0]).dt.total_seconds()
-                else:
-                    return kind, 0.0, 0.0
+        else:
+            groups[best].append((lname, best_score))
 
-    if len(t) == 0:
-        return kind, 0.0, 0.0
-
-    return kind, float(t.min()), float(t.max())
-
-
-def match_score(f_min, f_max, l_min, l_max) -> float:
-    """
-    Bidirectional overlap score — minimum of:
-      - fraction of log's duration covered by flight
-      - fraction of flight's duration covered by log
-    Penalises both under-coverage and over-coverage.
-    """
-    overlap     = max(0.0, min(f_max, l_max) - max(f_min, l_min))
-    log_frac    = overlap / (l_max - l_min) if (l_max - l_min) > 0 else 0
-    flight_frac = overlap / (f_max - f_min) if (f_max - f_min) > 0 else 0
-    return min(log_frac, flight_frac)
-
-
-def auto_match(flight_info: dict, log_info: dict) -> dict[str, list[str]]:
-    """
-    For each log, find the best matching flight using bidirectional overlap.
-    Returns: {flight_name: [log_name, ...]}
-    """
-    groups = defaultdict(list)
-    for lname, (_, lt_min, lt_max) in log_info.items():
-        scores = {
-            fname: match_score(ft_min, ft_max, lt_min, lt_max)
-            for fname, (_, ft_min, ft_max) in flight_info.items()
-        }
-        best_flight = max(scores, key=scores.get)
-        groups[best_flight].append(lname)
-
-    # Ensure every flight appears even if it got no logs
     for fname in flight_info:
         if fname not in groups:
             groups[fname] = []
 
-    return dict(groups)
+    return dict(groups), rejected, warnings
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -343,6 +376,22 @@ test_frac = st.sidebar.slider("Test split", 0.1, 0.4, 0.2, 0.05)
 seed      = st.sidebar.number_input("Random seed", value=42, step=1)
 
 st.sidebar.divider()
+st.sidebar.markdown("### Leave-One-Out Testing")
+st.sidebar.caption(
+    "Optionally hold out one entire flight from training. "
+    "This tests how well the model generalises to completely unseen conditions."
+)
+loo_enabled = st.sidebar.toggle("Hold out one flight", value=False)
+loo_flight  = None
+if loo_enabled:
+    # Populated after files are uploaded and matched
+    loo_flight = st.sidebar.selectbox(
+        "Flight to hold out (test only)",
+        options=["— upload files first —"],
+        key="loo_select",
+    )
+
+st.sidebar.divider()
 if st.sidebar.button("🔒 Log out", use_container_width=True):
     st.session_state["password_correct"] = False
     st.rerun()
@@ -385,29 +434,62 @@ if uploaded_files:
         st.stop()
 
     # Auto-match
-    groups = auto_match(flight_info, log_info)
+    groups, rejected, match_warnings = auto_match(flight_info, log_info)
+
+    # Populate LOO selectbox now that we know flight names
+    flight_names_for_loo = list(groups.keys())
+    if loo_enabled and flight_names_for_loo:
+        loo_flight = st.sidebar.selectbox(
+            "Flight to hold out (test only)",
+            options=flight_names_for_loo,
+            key="loo_select_real",
+            help="This flight will not be used in training — only for evaluation.",
+        )
+    else:
+        loo_flight = None
 
     # Show matching preview
     st.markdown("### Detected File Matching")
     st.caption(
-        "The pipeline automatically matched log files to flights by time overlap. "
+        "Log files are automatically matched to flights using absolute timestamps. "
         "Check this looks correct before running."
     )
 
+    # Show rejection warnings prominently
+    for w in match_warnings:
+        st.error(f"❌ {w}")
+
+    # Show rejected files info
+    if rejected:
+        with st.expander(f"⚠️ {len(rejected)} file(s) could not be matched — click to see details"):
+            for lname, score, best in rejected:
+                st.write(f"• **{lname}** — best match was `{best}` with score {score:.0%}")
+            st.write("These files will be excluded from the pipeline run.")
+
     cols = st.columns(max(len(groups), 1))
     all_ok = True
-    for col, (fname, lnames) in zip(cols, groups.items()):
+    for col, (fname, lmatches) in zip(cols, groups.items()):
+        lnames = [l for l, _ in lmatches]
+        scores = {l: s for l, s in lmatches}
         with col:
-            f_obj, ft_min, ft_max = flight_info[fname]
+            f_obj, fkind, ft_min, ft_max = (*flight_info[fname],)
+            # Format time range as HH:MM if in reasonable range
+            def fmt_tod(s):
+                if 0 < s < 86400:
+                    h, rem = divmod(int(s), 3600)
+                    m = rem // 60
+                    return f"{h:02d}:{m:02d} UTC"
+                return f"{s:.0f}s"
+
             st.markdown(f"""
             <div class="match-card">
                 <div class="match-title">✈ {fname}</div>
                 <div class="match-log" style="color:#6b7280;">
-                    {ft_min:.0f}s – {ft_max:.0f}s
+                    {fmt_tod(ft_min)} – {fmt_tod(ft_max)}
                 </div>
                 <hr style="border-color:#2a2d3e; margin:8px 0;">
             """ + "".join(
-                f'<div class="match-log">📋 {l}</div>'
+                f'<div class="match-log">📋 {l} <span style="color:#3ecf8e;">({scores[l]:.0%})</span></div>'
                 for l in lnames
             ) + ("" if lnames else
                  '<div class="match-log" style="color:#e05252;">⚠ No logs matched</div>'
@@ -416,7 +498,7 @@ if uploaded_files:
             if not lnames:
                 all_ok = False
 
-    if not all_ok:
+    if not all_ok and not match_warnings:
         st.warning(
             "One or more flights have no matching log files. "
             "Check your uploads and try again."
@@ -534,6 +616,9 @@ if run_clicked:
                     )
                     results.append((f"Flight {i + 1}", r))
 
+                # Build the session — if LOO is enabled, the held-out
+                # flight goes into a test-only split; all others use the
+                # random train/test split as normal
                 session = CombinedSession(
                     test_fraction=float(test_frac),
                     random_seed=int(seed),
@@ -541,7 +626,12 @@ if run_clicked:
                 for name, r in results:
                     session.add_flight(name, r)
 
-                combined = session.run()
+                # Apply LOO override if selected
+                loo_name = st.session_state.get("loo_select_real") if loo_enabled else None
+                if loo_name and loo_name in [n for n, _ in results]:
+                    combined = session.run(held_out_flight=loo_name)
+                else:
+                    combined = session.run()
 
                 vis = CombinedVisualiser(combined, output_dir=str(plot_dir))
                 vis.plot_all()
