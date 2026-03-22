@@ -212,19 +212,23 @@ def classify_and_get_range(uploaded_file) -> tuple[str, float, float]:
         # Case 1: TFS is numeric in seconds-past-midnight range (0–86400)
         tfs_num = pd.to_numeric(tfs_raw, errors="coerce").dropna()
         if len(tfs_num) > 10:
-            med = tfs_num.median()
-            if 0 < med < 86400:
-                # Valid seconds-past-midnight
+            med  = tfs_num.median()
+            span = float(tfs_num.max() - tfs_num.min())
+            # Only use if it spans a meaningful duration (>60s) to avoid
+            # files where TFS barely changes (e.g. log4 with float TFS)
+            if 0 < med < 86400 and span >= 60.0:
                 return kind, float(tfs_num.min()), float(tfs_num.max())
 
         # Case 2: TFS is a datetime string
         tfs_dt = pd.to_datetime(tfs_raw, errors="coerce").dropna()
         if len(tfs_dt) > 10 and tfs_dt.dt.year.median() > 2000:
-            tod = (tfs_dt.dt.hour * 3600 +
-                   tfs_dt.dt.minute * 60 +
-                   tfs_dt.dt.second +
-                   tfs_dt.dt.microsecond / 1e6)
-            return kind, float(tod.min()), float(tod.max())
+            tod  = (tfs_dt.dt.hour * 3600 +
+                    tfs_dt.dt.minute * 60 +
+                    tfs_dt.dt.second +
+                    tfs_dt.dt.microsecond / 1e6)
+            span = float(tod.max() - tod.min())
+            if span >= 60.0:
+                return kind, float(tod.min()), float(tod.max())
 
     # Case 3: TFS unreliable — use elapsed time for duration-based matching
     # Return kind="log_elapsed" so matcher uses duration similarity instead
@@ -251,31 +255,36 @@ def _containment_score(f_min, f_max, l_min, l_max) -> float:
     return overlap / log_span if log_span > 0 else 0.0
 
 
+def _tightness_score(f_min, f_max, l_min, l_max) -> float:
+    """
+    Tiebreaker: fraction of the flight window occupied by the log.
+    A shorter flight that fully contains the log scores higher than
+    a longer flight that also contains it.
+    """
+    f_dur = f_max - f_min
+    l_dur = l_max - l_min
+    return l_dur / f_dur if f_dur > 0 else 0.0
+
+
 def _duration_score(f_min, f_max, l_min, l_max) -> float:
-    """
-    Similarity of durations — used for logs without absolute timestamps.
-    Score of 1.0 means identical duration.
-    """
+    """Similarity of durations — for logs without absolute timestamps."""
     f_dur = f_max - f_min
     l_dur = l_max - l_min
     diff  = abs(f_dur - l_dur)
     return 1.0 - diff / max(f_dur, l_dur) if max(f_dur, l_dur) > 0 else 0.0
 
 
+_CONTAINMENT_ROUND_DP = 2  # absorbs small timestamp jitter between log and flight
+
+
 def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
     """
-    Match each log to its best flight and reject poor matches.
+    Match each log to its best flight using a two-key sort:
+      1. Containment score (rounded to absorb timing jitter)
+      2. Tightness — prefer the shortest flight that fully contains the log.
 
-    Logs with absolute timestamps (kind='log') are matched by containment:
-      what fraction of the log's duration falls within the flight window?
-
-    Logs with only elapsed time (kind='log_elapsed') are matched by duration
-    similarity: which flight has the most similar total duration?
-
-    Returns: (groups, rejected, warnings)
-      groups:   {flight_name: [(log_name, score), ...]}
-      rejected: [(log_name, best_score, best_flight_name)]
-      warnings: [human-readable warning string]
+    Logs with elapsed time only use duration similarity instead.
+    Matches below threshold are rejected with a warning.
     """
     groups   = defaultdict(list)
     rejected = []
@@ -283,28 +292,33 @@ def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
 
     for lname, (lkind, lt_min, lt_max) in log_info.items():
         if lkind == "log_elapsed":
-            # Duration-based matching for logs without absolute timestamps
-            scores = {
-                fname: _duration_score(fv[1], fv[2], lt_min, lt_max)
-                for fname, fv in flight_info.items()
-            }
-            threshold = 0.95  # duration must match within 5%
+            scores = {fn: _duration_score(fv[1], fv[2], lt_min, lt_max)
+                      for fn, fv in flight_info.items()}
+            threshold = 0.95
+            best = max(flight_info.keys(),
+                       key=lambda fn: (scores[fn],
+                                       _tightness_score(flight_info[fn][1],
+                                                        flight_info[fn][2],
+                                                        lt_min, lt_max)))
+            best_score = scores[best]
         else:
-            # Absolute containment matching
-            scores = {
-                fname: _containment_score(fv[1], fv[2], lt_min, lt_max)
-                for fname, fv in flight_info.items()
-            }
+            scores = {fn: _containment_score(fv[1], fv[2], lt_min, lt_max)
+                      for fn, fv in flight_info.items()}
             threshold = MATCH_THRESHOLD
-
-        best       = max(scores, key=scores.get)
-        best_score = scores[best]
+            best = max(flight_info.keys(),
+                       key=lambda fn: (
+                           round(scores[fn], _CONTAINMENT_ROUND_DP),
+                           _tightness_score(flight_info[fn][1],
+                                            flight_info[fn][2],
+                                            lt_min, lt_max)
+                       ))
+            best_score = scores[best]
 
         if best_score < threshold:
             rejected.append((lname, best_score, best))
             method = "duration similarity" if lkind == "log_elapsed" else "time containment"
             warnings.append(
-                f"**{lname}** could not be reliably matched to any flight "
+                f"**{lname}** could not be matched to any flight "
                 f"({method} {best_score:.0%} < {threshold:.0%}). "
                 f"Check that the correct files were uploaded."
             )
@@ -316,9 +330,6 @@ def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
             groups[fname] = []
 
     return dict(groups), rejected, warnings
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def save_uploaded(uploaded_file, tmp_dir: Path) -> Path:
     dest = tmp_dir / uploaded_file.name
