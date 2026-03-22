@@ -1,0 +1,8 @@
+data/raw/
+outputs/
+__pycache__/
+*.pyc
+.idea/
+
+# Project exclude paths
+/.venv/
