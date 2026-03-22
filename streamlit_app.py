@@ -472,7 +472,7 @@ if uploaded_files:
         lnames = [l for l, _ in lmatches]
         scores = {l: s for l, s in lmatches}
         with col:
-            f_obj, fkind, ft_min, ft_max = (*flight_info[fname],)
+            f_obj, ft_min, ft_max = flight_info[fname]
             # Format time range as HH:MM if in reasonable range
             def fmt_tod(s):
                 if 0 < s < 86400:
