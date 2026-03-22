@@ -139,6 +139,22 @@ _LOG_TIME_CANDIDATES = ["time s", "time_s", "time (s)", "elapsed_s", "time inc"]
 # for the match to be accepted. 0.80 = 80% of the log must be inside the flight.
 MATCH_THRESHOLD = 0.80
 
+# ── Hard-coded associations for known files ───────────────────────────────────
+# Format: {log_filename: flight_filename}
+# These take priority over the algorithmic matcher.
+# Add new known pairings here as more flights are collected.
+KNOWN_ASSOCIATIONS = {
+    # Flight 1475 — February 2023
+    "AIP_log3_WOW_0.xlsx":              "flight1475-AEROTEX-AIP-1_WOW0.xlsx",
+    "AIP_Log6_WOW_0.xlsx":              "flight1475-AEROTEX-AIP-2_WOW0.xlsx",
+    "AIP_Log7_WOW_0.xlsx":              "flight1475-AEROTEX-AIP-2_WOW0.xlsx",
+    # Flight 1476 — February 2023
+    "AIP_log_4_WOW_0.xlsx":             "Flight1476-AEROTEX-AIP-1_WOW_0.xlsx",
+    # Flight 1477 — March 2023
+    "AIP_log_7_WOW_0.xlsx":             "flight1477-AEROTEX-AIP-1_WOW_0.xlsx",
+    "AIP_log_8_WOW_0.xlsx":             "flight1477-AEROTEX-AIP-2_WOW_0.xlsx",
+}
+
 
 def classify_and_get_range(uploaded_file) -> tuple[str, float, float]:
     """
@@ -291,6 +307,19 @@ def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
     warnings = []
 
     for lname, (lkind, lt_min, lt_max) in log_info.items():
+
+        # ── Step 1: check hard-coded lookup table ─────────────────────────
+        known_flight = KNOWN_ASSOCIATIONS.get(lname)
+        if known_flight is not None:
+            matched = next(
+                (fn for fn in flight_info
+                 if fn.lower() == known_flight.lower()), None
+            )
+            if matched:
+                groups[matched].append((lname, 1.0))
+                continue
+
+        # ── Step 2: algorithmic matching ──────────────────────────────────
         if lkind == "log_elapsed":
             scores = {fn: _duration_score(fv[1], fv[2], lt_min, lt_max)
                       for fn, fv in flight_info.items()}
@@ -300,7 +329,6 @@ def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
                                        _tightness_score(flight_info[fn][1],
                                                         flight_info[fn][2],
                                                         lt_min, lt_max)))
-            best_score = scores[best]
         else:
             scores = {fn: _containment_score(fv[1], fv[2], lt_min, lt_max)
                       for fn, fv in flight_info.items()}
@@ -312,7 +340,7 @@ def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
                                             flight_info[fn][2],
                                             lt_min, lt_max)
                        ))
-            best_score = scores[best]
+        best_score = scores[best]
 
         if best_score < threshold:
             rejected.append((lname, best_score, best))
@@ -324,7 +352,6 @@ def auto_match(flight_info: dict, log_info: dict) -> tuple[dict, list, list]:
             )
         else:
             groups[best].append((lname, best_score))
-
     for fname in flight_info:
         if fname not in groups:
             groups[fname] = []
